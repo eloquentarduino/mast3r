@@ -5,8 +5,8 @@
 # --------------------------------------------------------
 # sparse gradio demo functions
 # --------------------------------------------------------
+from glob import glob
 import math
-import gradio
 import os
 import numpy as np
 import functools
@@ -24,9 +24,6 @@ from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import load_images
 from dust3r.utils.device import to_numpy
 from dust3r.viz import add_scene_cam, CAM_COLORS, OPENGL, pts3d_to_trimesh, cat_meshes
-from dust3r.demo import get_args_parser as dust3r_get_args_parser
-
-import matplotlib.pyplot as pl
 
 
 class SparseGAState():
@@ -45,21 +42,6 @@ class SparseGAState():
         if self.outfile_name is not None and os.path.isfile(self.outfile_name):
             os.remove(self.outfile_name)
         self.outfile_name = None
-
-
-def get_args_parser():
-    parser = dust3r_get_args_parser()
-    parser.add_argument('--share', action='store_true')
-    parser.add_argument('--gradio_delete_cache', default=None, type=int,
-                        help='age/frequency at which gradio removes the file. If >0, matching cache is purged')
-
-    actions = parser._actions
-    for action in actions:
-        if action.dest == 'model_name':
-            action.choices = ["MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"]
-    # change defaults
-    parser.prog = 'mast3r demo'
-    return parser
 
 
 def _convert_scene_output_to_glb(outfile, imgs, pts3d, mask, focals, cams2world, cam_size=0.05,
@@ -186,146 +168,3 @@ def get_reconstructed_scene(outdir, gradio_delete_cache, model, device, silent, 
     outfile = get_3D_model_from_scene(silent, scene_state, min_conf_thr, as_pointcloud, mask_sky,
                                       clean_depth, transparent_cams, cam_size, TSDF_thresh)
     return scene_state, outfile
-
-
-def set_scenegraph_options(inputfiles, win_cyclic, refid, scenegraph_type):
-    num_files = len(inputfiles) if inputfiles is not None else 1
-    show_win_controls = scenegraph_type in ["swin", "logwin"]
-    show_winsize = scenegraph_type in ["swin", "logwin"]
-    show_cyclic = scenegraph_type in ["swin", "logwin"]
-    max_winsize, min_winsize = 1, 1
-    if scenegraph_type == "swin":
-        if win_cyclic:
-            max_winsize = max(1, math.ceil((num_files - 1) / 2))
-        else:
-            max_winsize = num_files - 1
-    elif scenegraph_type == "logwin":
-        if win_cyclic:
-            half_size = math.ceil((num_files - 1) / 2)
-            max_winsize = max(1, math.ceil(math.log(half_size, 2)))
-        else:
-            max_winsize = max(1, math.ceil(math.log(num_files, 2)))
-    winsize = gradio.Slider(label="Scene Graph: Window Size", value=max_winsize,
-                            minimum=min_winsize, maximum=max_winsize, step=1, visible=show_winsize)
-    win_cyclic = gradio.Checkbox(value=win_cyclic, label="Cyclic sequence", visible=show_cyclic)
-    win_col = gradio.Column(visible=show_win_controls)
-    refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0,
-                          maximum=num_files - 1, step=1, visible=scenegraph_type == 'oneref')
-    return win_col, winsize, win_cyclic, refid
-
-
-def main_demo(tmpdirname, model, device, image_size, server_name, server_port, silent=False,
-              share=False, gradio_delete_cache=False):
-    if not silent:
-        print('Outputing stuff in', tmpdirname)
-
-    recon_fun = functools.partial(get_reconstructed_scene, tmpdirname, gradio_delete_cache, model, device,
-                                  silent, image_size)
-    model_from_scene_fun = functools.partial(get_3D_model_from_scene, silent)
-
-    def get_context(delete_cache):
-        css = """.gradio-container {margin: 0 !important; min-width: 100%};"""
-        title = "MASt3R Demo"
-        if delete_cache:
-            return gradio.Blocks(css=css, title=title, delete_cache=(delete_cache, delete_cache))
-        else:
-            return gradio.Blocks(css=css, title="MASt3R Demo")  # for compatibility with older versions
-
-    with get_context(gradio_delete_cache) as demo:
-        # scene state is save so that you can change conf_thr, cam_size... without rerunning the inference
-        scene = gradio.State(None)
-        gradio.HTML('<h2 style="text-align: center;">MASt3R Demo</h2>')
-        with gradio.Column():
-            inputfiles = gradio.File(file_count="multiple")
-            with gradio.Row():
-                with gradio.Column():
-                    with gradio.Row():
-                        lr1 = gradio.Slider(label="Coarse LR", value=0.07, minimum=0.01, maximum=0.2, step=0.01)
-                        niter1 = gradio.Number(value=500, precision=0, minimum=0, maximum=10_000,
-                                               label="num_iterations", info="For coarse alignment!")
-                        lr2 = gradio.Slider(label="Fine LR", value=0.014, minimum=0.005, maximum=0.05, step=0.001)
-                        niter2 = gradio.Number(value=200, precision=0, minimum=0, maximum=100_000,
-                                               label="num_iterations", info="For refinement!")
-                        optim_level = gradio.Dropdown(["coarse", "refine", "refine+depth"],
-                                                      value='refine+depth', label="OptLevel",
-                                                      info="Optimization level")
-                    with gradio.Row():
-                        matching_conf_thr = gradio.Slider(label="Matching Confidence Thr", value=5.,
-                                                          minimum=0., maximum=30., step=0.1,
-                                                          info="Before Fallback to Regr3D!")
-                        shared_intrinsics = gradio.Checkbox(value=False, label="Shared intrinsics",
-                                                            info="Only optimize one set of intrinsics for all views")
-                        scenegraph_type = gradio.Dropdown([("complete: all possible image pairs", "complete"),
-                                                           ("swin: sliding window", "swin"),
-                                                           ("logwin: sliding window with long range", "logwin"),
-                                                           ("oneref: match one image with all", "oneref")],
-                                                          value='complete', label="Scenegraph",
-                                                          info="Define how to make pairs",
-                                                          interactive=True)
-                        with gradio.Column(visible=False) as win_col:
-                            winsize = gradio.Slider(label="Scene Graph: Window Size", value=1,
-                                                    minimum=1, maximum=1, step=1)
-                            win_cyclic = gradio.Checkbox(value=False, label="Cyclic sequence")
-                        refid = gradio.Slider(label="Scene Graph: Id", value=0,
-                                              minimum=0, maximum=0, step=1, visible=False)
-            run_btn = gradio.Button("Run")
-
-            with gradio.Row():
-                # adjust the confidence threshold
-                min_conf_thr = gradio.Slider(label="min_conf_thr", value=1.5, minimum=0.0, maximum=10, step=0.1)
-                # adjust the camera size in the output pointcloud
-                cam_size = gradio.Slider(label="cam_size", value=0.2, minimum=0.001, maximum=1.0, step=0.001)
-                TSDF_thresh = gradio.Slider(label="TSDF Threshold", value=0., minimum=0., maximum=1., step=0.01)
-            with gradio.Row():
-                as_pointcloud = gradio.Checkbox(value=True, label="As pointcloud")
-                # two post process implemented
-                mask_sky = gradio.Checkbox(value=False, label="Mask sky")
-                clean_depth = gradio.Checkbox(value=True, label="Clean-up depthmaps")
-                transparent_cams = gradio.Checkbox(value=False, label="Transparent cameras")
-
-            outmodel = gradio.Model3D()
-
-            # events
-            scenegraph_type.change(set_scenegraph_options,
-                                   inputs=[inputfiles, win_cyclic, refid, scenegraph_type],
-                                   outputs=[win_col, winsize, win_cyclic, refid])
-            inputfiles.change(set_scenegraph_options,
-                              inputs=[inputfiles, win_cyclic, refid, scenegraph_type],
-                              outputs=[win_col, winsize, win_cyclic, refid])
-            win_cyclic.change(set_scenegraph_options,
-                              inputs=[inputfiles, win_cyclic, refid, scenegraph_type],
-                              outputs=[win_col, winsize, win_cyclic, refid])
-            run_btn.click(fn=recon_fun,
-                          inputs=[scene, inputfiles, optim_level, lr1, niter1, lr2, niter2, min_conf_thr, matching_conf_thr,
-                                  as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
-                                  scenegraph_type, winsize, win_cyclic, refid, TSDF_thresh, shared_intrinsics],
-                          outputs=[scene, outmodel])
-            min_conf_thr.release(fn=model_from_scene_fun,
-                                 inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                         clean_depth, transparent_cams, cam_size, TSDF_thresh],
-                                 outputs=outmodel)
-            cam_size.change(fn=model_from_scene_fun,
-                            inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                    clean_depth, transparent_cams, cam_size, TSDF_thresh],
-                            outputs=outmodel)
-            TSDF_thresh.change(fn=model_from_scene_fun,
-                               inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                       clean_depth, transparent_cams, cam_size, TSDF_thresh],
-                               outputs=outmodel)
-            as_pointcloud.change(fn=model_from_scene_fun,
-                                 inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                         clean_depth, transparent_cams, cam_size, TSDF_thresh],
-                                 outputs=outmodel)
-            mask_sky.change(fn=model_from_scene_fun,
-                            inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                    clean_depth, transparent_cams, cam_size, TSDF_thresh],
-                            outputs=outmodel)
-            clean_depth.change(fn=model_from_scene_fun,
-                               inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                       clean_depth, transparent_cams, cam_size, TSDF_thresh],
-                               outputs=outmodel)
-            transparent_cams.change(model_from_scene_fun,
-                                    inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                            clean_depth, transparent_cams, cam_size, TSDF_thresh],
-                                    outputs=outmodel)
-    demo.launch(share=share, server_name=server_name, server_port=server_port)
